@@ -12,13 +12,13 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write, stdout};
+use std::io::{self, stdout, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
@@ -38,8 +38,6 @@ impl SessionInfo {
     fn short_id(&self) -> &str {
         &self.session_id[..self.session_id.len().min(8)]
     }
-
-    
 }
 
 #[derive(Deserialize)]
@@ -135,11 +133,13 @@ impl Message {
             .trim()
             .to_string()
     }
-
 }
 
 fn block_text(block: &Value) -> Option<String> {
-    block.get("text").and_then(Value::as_str).map(str::to_string)
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn format_with_commas(n: u64) -> String {
@@ -176,7 +176,11 @@ fn human_file_size(size: u64) -> String {
 }
 
 fn file_size_for_session(file_path: &Option<String>) -> (String, bool) {
-    match file_path.as_deref().and_then(|path| fs::metadata(path).ok()).map(|m| m.len()) {
+    match file_path
+        .as_deref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|m| m.len())
+    {
         Some(size) => (human_file_size(size), size > 1_048_576),
         None => ("—".to_string(), false),
     }
@@ -296,7 +300,9 @@ impl SessionStore {
     fn find_session_file(&self, session_id: &str, project: &str) -> Option<PathBuf> {
         if !project.is_empty() {
             let encoded = Self::encode_path(project);
-            let candidate = Self::projects_dir().join(encoded).join(format!("{session_id}.jsonl"));
+            let candidate = Self::projects_dir()
+                .join(encoded)
+                .join(format!("{session_id}.jsonl"));
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -359,8 +365,8 @@ impl SessionStore {
     ) -> Result<Vec<(SessionInfo, Message, String)>> {
         self.load();
 
-        let pattern = Regex::new(&format!("(?i){query}"))
-            .map_err(|err| anyhow!("invalid regex: {err}"))?;
+        let pattern =
+            Regex::new(&format!("(?i){query}")).map_err(|err| anyhow!("invalid regex: {err}"))?;
 
         let mut results: Vec<(SessionInfo, Message, String)> = Vec::new();
         for session in self.all() {
@@ -457,7 +463,12 @@ fn truncate(text: &str, width: usize) -> String {
     }
 }
 
-fn render_conversation(store: &SessionStore, session: &SessionInfo, thinking: bool, tail: Option<usize>) -> Vec<String> {
+fn render_conversation(
+    store: &SessionStore,
+    session: &SessionInfo,
+    thinking: bool,
+    tail: Option<usize>,
+) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!("Session: {}", truncate(&session.display, 120)));
     lines.push(format!(
@@ -512,10 +523,7 @@ fn render_conversation(store: &SessionStore, session: &SessionInfo, thinking: bo
                     let input = block.get("input").unwrap_or(&Value::Null);
                     let summary = match name {
                         "Bash" => {
-                            let cmd = input
-                                .get("command")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
+                            let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
                             let desc = input
                                 .get("description")
                                 .and_then(Value::as_str)
@@ -532,7 +540,10 @@ fn render_conversation(store: &SessionStore, session: &SessionInfo, thinking: bo
                             format!("{name} {target}")
                         }
                         "Task" => {
-                            let desc = input.get("description").and_then(Value::as_str).unwrap_or("");
+                            let desc = input
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
                             format!("Task {desc}")
                         }
                         "WebSearch" => {
@@ -594,11 +605,7 @@ fn render_search_results(results: Vec<(SessionInfo, Message, String)>) -> String
 fn render_stats(stats: &Value) -> String {
     fn short_model(name: &str) -> String {
         let trimmed = name.strip_prefix("claude-").unwrap_or(name);
-        trimmed
-            .split("-202")
-            .next()
-            .unwrap_or(trimmed)
-            .to_string()
+        trimmed.split("-202").next().unwrap_or(trimmed).to_string()
     }
 
     fn render_bar(count: u64, max_count: u64, width: usize) -> String {
@@ -630,8 +637,14 @@ fn render_stats(stats: &Value) -> String {
     out.push_str(&format!("│{:^width$}│\n", title, width = FRAME_W - 2));
     out.push_str(&format!("╰{}╯\n\n", "─".repeat(FRAME_W - 2)));
 
-    let total_sessions = stats.get("totalSessions").and_then(Value::as_u64).unwrap_or(0);
-    let total_messages = stats.get("totalMessages").and_then(Value::as_u64).unwrap_or(0);
+    let total_sessions = stats
+        .get("totalSessions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_messages = stats
+        .get("totalMessages")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let first = stats
         .get("firstSessionDate")
         .and_then(Value::as_str)
@@ -640,7 +653,11 @@ fn render_stats(stats: &Value) -> String {
         .get("lastComputedDate")
         .and_then(Value::as_str)
         .unwrap_or("—");
-    let first_short = if first.len() >= 10 { &first[..10] } else { first };
+    let first_short = if first.len() >= 10 {
+        &first[..10]
+    } else {
+        first
+    };
 
     out.push_str(&format!("Total sessions: {total_sessions}\n"));
     out.push_str(&format!("Total messages: {total_messages}\n"));
@@ -649,8 +666,14 @@ fn render_stats(stats: &Value) -> String {
     out.push('\n');
 
     if let Some(longest) = stats.get("longestSession").and_then(Value::as_object) {
-        let dur = longest.get("duration").and_then(Value::as_f64).unwrap_or(0.0);
-        let msgs = longest.get("messageCount").and_then(Value::as_u64).unwrap_or(0);
+        let dur = longest
+            .get("duration")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let msgs = longest
+            .get("messageCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         out.push_str(&format!(
             "Longest session: {:.1}h ({} msgs)\n",
             dur / 1000.0 / 3600.0,
@@ -676,12 +699,7 @@ fn render_stats(stats: &Value) -> String {
 
         rows.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let model_width = rows
-            .iter()
-            .map(|r| r.0.len())
-            .max()
-            .unwrap_or(5)
-            .max(5);
+        let model_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
         let out_width = rows
             .iter()
             .map(|r| format_with_commas(r.1).len())
@@ -763,7 +781,11 @@ fn render_stats(stats: &Value) -> String {
             out.push_str(&table_divider("┣", "╋", "┫", &columns));
             out.push('\n');
 
-            let start = if daily.len() > 14 { daily.len() - 14 } else { 0 };
+            let start = if daily.len() > 14 {
+                daily.len() - 14
+            } else {
+                0
+            };
             let window = &daily[start..];
             let max_msgs = window
                 .iter()
@@ -775,7 +797,10 @@ fn render_stats(stats: &Value) -> String {
                 let date = day.get("date").and_then(Value::as_str).unwrap_or("");
                 let sessions = day.get("sessionCount").and_then(Value::as_u64).unwrap_or(0);
                 let msgs = day.get("messageCount").and_then(Value::as_u64).unwrap_or(0);
-                let tools = day.get("toolCallCount").and_then(Value::as_u64).unwrap_or(0);
+                let tools = day
+                    .get("toolCallCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 let bar = render_bar(msgs, max_msgs, bar_w);
                 out.push_str(&format!(
                     "┃ {date:<dw$} ┃ {sessions:>sw$} ┃ {msgs:>mw$} ┃ {tools:>tw$} ┃ {bar:<bw$} ┃\n",
@@ -801,7 +826,10 @@ fn render_stats(stats: &Value) -> String {
             out.push_str("Activity by hour:\n");
             let max_count = hours.values().filter_map(Value::as_u64).max().unwrap_or(1);
             for hour in 0..24 {
-                let count = hours.get(&hour.to_string()).and_then(Value::as_u64).unwrap_or(0);
+                let count = hours
+                    .get(&hour.to_string())
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 let bar = render_bar(count, max_count, 30);
                 if bar.is_empty() {
                     out.push_str(&format!("  {:02}:00          (0)\n", hour));
@@ -842,7 +870,10 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
     for s in subset {
         let short_id = s.short_id();
         let time = relative_time(s.timestamp);
-        let proj = truncate(&short_project(&s.project), 24).chars().take(24).collect::<String>();
+        let proj = truncate(&short_project(&s.project), 24)
+            .chars()
+            .take(24)
+            .collect::<String>();
         let title = truncate(&s.display, 36);
         out.push_str(&format!("{short_id:8}  {time:<8}  {proj:<24}  {title}\n"));
     }
@@ -867,7 +898,11 @@ fn run_tui() -> Result<()> {
     loop {
         terminal.draw(|f| {
             let size = f.size();
-            let top_height = if in_detail { 0u16 } else { (filter_input as u16) + 1 };
+            let top_height = if in_detail {
+                0u16
+            } else {
+                (filter_input as u16) + 1
+            };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -906,10 +941,7 @@ fn run_tui() -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                let lines: Vec<Line> = slice
-                    .iter()
-                    .map(|line| Line::from(line.clone()))
-                    .collect();
+                let lines: Vec<Line> = slice.iter().map(|line| Line::from(line.clone())).collect();
                 f.render_widget(
                     Paragraph::new(lines)
                         .block(Block::default().borders(Borders::ALL).title("Session")),
@@ -922,10 +954,9 @@ fn run_tui() -> Result<()> {
                         let time = relative_time(s.timestamp);
                         let project = truncate(&short_project(&s.project), 24);
                         let (size, is_large_size) = file_size_for_session(&s.file_path);
-                        let prompt_w =
-                            (chunks[1].width as usize)
-                                .saturating_sub(10 + 3 + 24 + 3 + 8 + 3)
-                                .max(20);
+                        let prompt_w = (chunks[1].width as usize)
+                            .saturating_sub(10 + 3 + 24 + 3 + 8 + 3)
+                            .max(20);
                         let prompt = truncate(&s.display, prompt_w);
                         let size_style = if is_large_size {
                             Style::default().fg(Color::Red)
@@ -933,7 +964,10 @@ fn run_tui() -> Result<()> {
                             Style::default().fg(Color::DarkGray)
                         };
                         let row = Line::from(vec![
-                            Span::styled(format!("{time:>10}"), Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("{time:>10}"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
                             Span::from("   "),
                             Span::styled(format!("{project:24}"), Style::default().fg(Color::Cyan)),
                             Span::from("   "),
@@ -953,8 +987,7 @@ fn run_tui() -> Result<()> {
             }
 
             f.render_widget(
-                Paragraph::new(status)
-                    .style(Style::default().fg(Color::White)),
+                Paragraph::new(status).style(Style::default().fg(Color::White)),
                 chunks[2],
             );
         })?;
@@ -1048,7 +1081,13 @@ fn run_tui() -> Result<()> {
                             i
                         }
                     }
-                    None => if len > 0 { 0 } else { 0 },
+                    None => {
+                        if len > 0 {
+                            0
+                        } else {
+                            0
+                        }
+                    }
                 };
                 list_state.select(Some(next));
             }
@@ -1146,7 +1185,13 @@ fn home_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_else(|_| String::from("/Users/mbm-gsc")))
 }
 
-fn list_command(store: &mut SessionStore, project: Option<String>, since: Option<String>, limit: usize, json: bool) -> Result<String> {
+fn list_command(
+    store: &mut SessionStore,
+    project: Option<String>,
+    since: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<String> {
     let mut sessions = store.all();
 
     if let Some(p) = project.as_deref() {
@@ -1160,8 +1205,7 @@ fn list_command(store: &mut SessionStore, project: Option<String>, since: Option
     if let Some(since_s) = since {
         let since_ms = chrono::NaiveDate::parse_from_str(&since_s, "%Y-%m-%d")
             .map(|date| {
-                date
-                    .and_hms_opt(0, 0, 0)
+                date.and_hms_opt(0, 0, 0)
                     .and_then(|naive| Local.from_local_datetime(&naive).single())
                     .map(|ts| ts.timestamp_millis())
             })
@@ -1173,7 +1217,7 @@ fn list_command(store: &mut SessionStore, project: Option<String>, since: Option
             .into_iter()
             .filter(|s| s.timestamp >= since_ms)
             .collect();
-        }
+    }
 
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(list_sessions(sessions, json, limit))
@@ -1237,17 +1281,24 @@ fn main() -> Result<()> {
             let lines = render_conversation(&store, &session, thinking, tail);
             output_with_optional_pager(&lines.join("\n"), no_pager)?;
         }
-        Some(Commands::Search { query, project, max }) => {
+        Some(Commands::Search {
+            query,
+            project,
+            max,
+        }) => {
             let results = store.search(&query, project.as_deref(), max)?;
             println!("{}", render_search_results(results));
         }
         Some(Commands::Stats) => {
-            let stats = store
-                .load_stats()
-                .context("No stats-cache.json found")?;
+            let stats = store.load_stats().context("No stats-cache.json found")?;
             println!("{}", render_stats(&stats));
         }
-        Some(Commands::List { project, since, limit, json }) => {
+        Some(Commands::List {
+            project,
+            since,
+            limit,
+            json,
+        }) => {
             let output = list_command(&mut store, project, since, limit, json)?;
             println!("{}", output);
         }
