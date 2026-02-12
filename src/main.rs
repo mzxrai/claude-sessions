@@ -1158,11 +1158,28 @@ fn shell_single_quote(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn resume_session(session: &SessionInfo) -> Result<()> {
-    if let Some(project_path) = Path::new(&session.project).canonicalize().ok() {
-        let _ = std::env::set_current_dir(project_path);
+fn resolve_resume_cwd(session: &SessionInfo) -> Result<PathBuf> {
+    let configured = Path::new(&session.project);
+    if configured.as_os_str().is_empty() {
+        return Err(anyhow!("Session project path is empty"));
     }
 
+    if !configured.exists() {
+        fs::create_dir_all(configured)
+            .with_context(|| format!("failed to create project directory {}", configured.display()))?;
+    }
+
+    if configured.exists() {
+        return Ok(configured.to_path_buf());
+    }
+
+    Err(anyhow!(
+        "Failed to create or resolve session project directory: {}",
+        configured.display()
+    ))
+}
+
+fn resume_session(session: &SessionInfo) -> Result<()> {
     let session_id = shell_single_quote(&session.session_id);
     let script = format!(
         "cc_session_id={}; if whence -w cc >/dev/null 2>&1; then cc --resume \"$cc_session_id\"; else claude --resume \"$cc_session_id\"; fi",
@@ -1171,6 +1188,8 @@ fn resume_session(session: &SessionInfo) -> Result<()> {
 
     let mut cmd = Command::new("zsh");
     cmd.arg("-ic").arg(script);
+    let project_path = resolve_resume_cwd(session)?;
+    cmd.current_dir(project_path);
     let status = cmd
         .status()
         .with_context(|| "failed to launch shell resume command")?;
