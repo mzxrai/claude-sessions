@@ -17,20 +17,93 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::io::{self, stdout, IsTerminal, Write};
+use std::fs::{self, File};
+use std::io::{self, stdout, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
 
 const INTERNAL_TYPES: [&str; 3] = ["file-history-snapshot", "progress", "queue-operation"];
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+enum SessionSource {
+    Claudecode,
+    Codex,
+}
+
+impl SessionSource {
+    fn all() -> &'static [Self] {
+        &[Self::Claudecode, Self::Codex]
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Claudecode => "claude code",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn resume_command(&self) -> &'static str {
+        match self {
+            Self::Claudecode => "cc",
+            Self::Codex => "c",
+        }
+    }
+
+    fn fallback_resume_command(&self) -> &'static str {
+        match self {
+            Self::Claudecode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn resume_invocation(&self) -> &'static str {
+        match self {
+            Self::Claudecode => "--resume \"$cs_session_id\"",
+            Self::Codex => "resume \"$cs_session_id\"",
+        }
+    }
+
+    fn history_file(&self) -> PathBuf {
+        self.home_base().join("history.jsonl")
+    }
+
+    fn projects_dir(&self) -> PathBuf {
+        self.home_base().join("projects")
+    }
+
+    fn stats_file(&self) -> PathBuf {
+        self.home_base().join("stats-cache.json")
+    }
+
+    fn sessions_dir(&self) -> PathBuf {
+        self.home_base().join("sessions")
+    }
+
+    fn archived_sessions_dir(&self) -> PathBuf {
+        self.home_base().join("archived_sessions")
+    }
+
+    fn home_base(&self) -> PathBuf {
+        match self {
+            Self::Claudecode => home_dir().join(".claude"),
+            Self::Codex => home_dir().join(".codex"),
+        }
+    }
+
+    fn internal_key(&self, session_id: &str) -> String {
+        format!("{}::{session_id}", self.label())
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct SessionInfo {
+    source: SessionSource,
     session_id: String,
     display: String,
     project: String,
     timestamp: i64,
+    model: String,
     file_path: Option<String>,
 }
 
@@ -44,12 +117,32 @@ impl SessionInfo {
 struct HistoryEntry {
     #[serde(alias = "sessionId")]
     session_id: Option<String>,
+    session_id_legacy: Option<String>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(alias = "ts", default)]
+    ts: Option<i64>,
     #[serde(default)]
     display: String,
     #[serde(default)]
-    timestamp: i64,
+    text: String,
     #[serde(default)]
     project: String,
+}
+
+#[derive(Deserialize)]
+struct CodexSessionMeta {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    timestamp: String,
+}
+
+#[derive(Default)]
+struct CodexSessionFileInfo {
+    cwd: Option<String>,
+    timestamp_ms: Option<i64>,
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -135,11 +228,114 @@ impl Message {
     }
 }
 
+fn parse_codex_message(line: &str) -> Option<Message> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str)? != "message" {
+        return None;
+    }
+
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    let msg_type = match role {
+        "user" => "user",
+        "assistant" => "assistant",
+        "developer" => "assistant",
+        _ => "assistant",
+    };
+
+    Some(Message {
+        msg_type: msg_type.to_string(),
+        _uuid: String::new(),
+        _timestamp: value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        is_api_error: false,
+        _session_id: payload
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("sessionId").and_then(Value::as_str))
+            .or_else(|| payload.get("session_id").and_then(Value::as_str))
+            .or_else(|| value.get("session_id").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string(),
+        message: json!({
+            "role": role,
+            "content": payload.get("content").unwrap_or(&Value::Null),
+            "model": payload.get("model").unwrap_or(&Value::Null),
+        }),
+    })
+}
+
 fn block_text(block: &Value) -> Option<String> {
+    if !matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("text") | Some("input_text") | Some("output_text")
+    ) {
+        return None;
+    }
+
     block
         .get("text")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn normalize_timestamp(ts: Option<i64>) -> i64 {
+    match ts {
+        Some(raw) if raw > 0 && raw < 1_000_000_000_000 => raw * 1000,
+        Some(raw) => raw,
+        None => 0,
+    }
+}
+
+fn codex_iso_to_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|value| value.timestamp_millis())
+}
+
+fn codex_model_candidate(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || trimmed == "<synthetic>" {
+        return None;
+    }
+
+    let is_valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'));
+    if is_valid {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn codex_entry_session_id(value: &Value) -> Option<&str> {
+    value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("session_id").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("sessionId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("session_id"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn format_with_commas(n: u64) -> String {
@@ -199,18 +395,6 @@ impl SessionStore {
         }
     }
 
-    fn history_file() -> PathBuf {
-        home_dir().join(".claude/history.jsonl")
-    }
-
-    fn projects_dir() -> PathBuf {
-        home_dir().join(".claude/projects")
-    }
-
-    fn stats_file() -> PathBuf {
-        home_dir().join(".claude/stats-cache.json")
-    }
-
     fn encode_path(path: &str) -> String {
         path.replace('/', "-")
     }
@@ -220,49 +404,100 @@ impl SessionStore {
             return;
         }
 
-        let history_path = Self::history_file();
-        if !history_path.exists() {
-            self.loaded = true;
-            return;
-        }
-
         let mut seen: HashMap<String, SessionInfo> = HashMap::new();
-        let content = fs::read_to_string(&history_path).unwrap_or_default();
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        for source in SessionSource::all() {
+            let history_path = source.history_file();
+            if !history_path.exists() {
                 continue;
             }
 
-            let entry: HistoryEntry = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let content = fs::read_to_string(&history_path).unwrap_or_default();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
 
-            let session_id = match entry.session_id {
-                Some(id) if !id.is_empty() => id,
-                _ => continue,
-            };
+                let entry: HistoryEntry = match serde_json::from_str(line) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
 
-            match seen.get_mut(&session_id) {
-                Some(existing) => {
-                    if entry.timestamp > existing.timestamp {
-                        existing.timestamp = entry.timestamp;
+                let session_id = match entry.session_id.or(entry.session_id_legacy) {
+                    Some(id) if !id.is_empty() => id,
+                    _ => continue,
+                };
+
+                let mut display = if !entry.display.is_empty() {
+                    entry.display
+                } else {
+                    entry.text
+                };
+
+                let mut project = entry.project;
+                let mut timestamp = normalize_timestamp(entry.timestamp.or(entry.ts));
+                let mut model = String::new();
+
+                let file_path = self.find_session_file(*source, &session_id, &project);
+                let mut codex_meta = None;
+                if *source == SessionSource::Codex {
+                    if let Some(file_path) = file_path.as_deref() {
+                        codex_meta = self.codex_file_info_from_session_file(file_path, &session_id);
                     }
                 }
-                None => {
-                    let file_path = self.find_session_file(&session_id, &entry.project);
-                    seen.insert(
-                        session_id.clone(),
-                        SessionInfo {
-                            session_id,
-                            display: entry.display,
-                            project: entry.project,
-                            timestamp: entry.timestamp,
-                            file_path: file_path.map(|p| p.to_string_lossy().to_string()),
-                        },
-                    );
+
+                if let Some(codex_meta) = codex_meta {
+                    if project.is_empty() {
+                        if let Some(cwd) = codex_meta.cwd {
+                            if !cwd.is_empty() {
+                                project = cwd;
+                            }
+                        }
+                    }
+                    if timestamp == 0 {
+                        timestamp = codex_meta.timestamp_ms.unwrap_or(0);
+                    }
+                    if let Some(found_model) = codex_meta.model {
+                        model = found_model;
+                    }
+                }
+
+                if display.is_empty() {
+                    display = project.clone();
+                }
+
+                if display.is_empty() && timestamp == 0 {
+                    continue;
+                }
+
+                let key = source.internal_key(&session_id);
+                match seen.get_mut(&key) {
+                    Some(existing) => {
+                        if timestamp > existing.timestamp {
+                            existing.timestamp = timestamp;
+                            existing.display = display.clone();
+                            existing.project = project.clone();
+                            if !model.is_empty() {
+                                existing.model = model.clone();
+                            }
+                            existing.file_path = file_path.map(|p| p.to_string_lossy().to_string());
+                        }
+                    }
+                    None => {
+                        seen.insert(
+                            source.internal_key(&session_id),
+                            SessionInfo {
+                                source: *source,
+                                session_id,
+                                display,
+                                project,
+                                timestamp,
+                                model,
+                                file_path: file_path.map(|p| p.to_string_lossy().to_string()),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -280,27 +515,39 @@ impl SessionStore {
 
     fn get(&mut self, session_id: &str) -> Option<SessionInfo> {
         self.load();
-        if let Some(session) = self.sessions.get(session_id) {
-            return Some(session.clone());
-        }
-
+        let mut exact_matches = Vec::new();
         let mut matches = Vec::new();
-        for (id, session) in &self.sessions {
-            if id.starts_with(session_id) {
+        for session in self.sessions.values() {
+            if session.session_id == session_id {
+                exact_matches.push(session.clone());
+            } else if session.session_id.starts_with(session_id) {
                 matches.push(session.clone());
             }
         }
-        if matches.len() == 1 {
-            matches.into_iter().next()
-        } else {
-            None
+
+        if exact_matches.len() == 1 {
+            return exact_matches.into_iter().next();
         }
+        if !exact_matches.is_empty() {
+            return None;
+        }
+
+        if matches.len() == 1 {
+            return matches.into_iter().next();
+        }
+        None
     }
 
-    fn find_session_file(&self, session_id: &str, project: &str) -> Option<PathBuf> {
+    fn find_session_file(
+        &self,
+        source: SessionSource,
+        session_id: &str,
+        project: &str,
+    ) -> Option<PathBuf> {
         if !project.is_empty() {
             let encoded = Self::encode_path(project);
-            let candidate = Self::projects_dir()
+            let candidate = source
+                .projects_dir()
                 .join(encoded)
                 .join(format!("{session_id}.jsonl"));
             if candidate.exists() {
@@ -308,7 +555,21 @@ impl SessionStore {
             }
         }
 
-        let projects_dir = Self::projects_dir();
+        if source == SessionSource::Codex {
+            if let Some(found) =
+                Self::find_file_by_session_id(&source.sessions_dir(), session_id, 4)
+            {
+                return Some(found);
+            }
+
+            if let Some(found) =
+                Self::find_file_by_session_id(&source.archived_sessions_dir(), session_id, 4)
+            {
+                return Some(found);
+            }
+        }
+
+        let projects_dir = source.projects_dir();
         if !projects_dir.exists() {
             return None;
         }
@@ -324,6 +585,155 @@ impl SessionStore {
             }
         }
         None
+    }
+
+    fn find_file_by_session_id(
+        dir: &Path,
+        session_id: &str,
+        depth_remaining: usize,
+    ) -> Option<PathBuf> {
+        if depth_remaining == 0 || !dir.exists() {
+            return None;
+        }
+
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_file() {
+                let is_jsonl = p.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
+                if !is_jsonl {
+                    continue;
+                }
+
+                let name = p.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                if name.contains(session_id) {
+                    return Some(p);
+                }
+                continue;
+            }
+
+            if p.is_dir() {
+                if let Some(found) =
+                    Self::find_file_by_session_id(&p, session_id, depth_remaining - 1)
+                {
+                    return Some(found);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn codex_file_info_from_session_file(
+        &self,
+        path: &Path,
+        expected_session_id: &str,
+    ) -> Option<CodexSessionFileInfo> {
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        let mut out = CodexSessionFileInfo::default();
+        let mut saw_session_meta = false;
+        let mut current_session_matches = true;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let entry_type = value.get("type").and_then(Value::as_str);
+            if entry_type == Some("session_meta") {
+                saw_session_meta = true;
+                let payload = match value.get("payload") {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                current_session_matches = id.is_empty() || id == expected_session_id;
+                if !id.is_empty() && id != expected_session_id {
+                    continue;
+                }
+
+                let parsed: CodexSessionMeta = serde_json::from_value(payload.clone()).ok()?;
+                if !parsed.id.is_empty() && !id.is_empty() && parsed.id != id {
+                    continue;
+                }
+
+                let cwd = payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !cwd.is_empty() {
+                    out.cwd = Some(cwd);
+                }
+
+                let ts = payload
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(codex_iso_to_ms)
+                    .or_else(|| codex_iso_to_ms(&parsed.timestamp));
+                if let Some(ts) = ts {
+                    out.timestamp_ms = Some(ts);
+                }
+                continue;
+            }
+
+            let line_session_id = codex_entry_session_id(&value);
+            if let Some(found_session_id) = line_session_id {
+                if found_session_id != expected_session_id {
+                    continue;
+                }
+            } else if saw_session_meta && !current_session_matches {
+                continue;
+            }
+
+            if entry_type == Some("turn_context") {
+                let payload = match value.get("payload") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if let Some(model) = payload.get("model").and_then(Value::as_str) {
+                    if let Some(model) = codex_model_candidate(model) {
+                        out.model = Some(model);
+                    }
+                }
+                continue;
+            }
+
+            if entry_type == Some("response_item") {
+                let payload = match value.get("payload") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                if let Some(model) = payload.get("model").and_then(Value::as_str) {
+                    if let Some(model) = codex_model_candidate(model) {
+                        out.model = Some(model);
+                    }
+                }
+            }
+        }
+
+        if out.cwd.is_none() && out.timestamp_ms.is_none() && out.model.is_none() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn read_messages(&self, session: &SessionInfo, skip_internal: bool) -> Vec<Message> {
@@ -343,12 +753,17 @@ impl SessionStore {
                 continue;
             }
 
-            let raw: RawMessage = match serde_json::from_str(line) {
-                Ok(raw) => raw,
-                Err(_) => continue,
+            let msg = match session.source {
+                SessionSource::Claudecode => match serde_json::from_str::<RawMessage>(line) {
+                    Ok(raw) => Some(Message::from(raw)),
+                    Err(_) => None,
+                },
+                SessionSource::Codex => parse_codex_message(line),
             };
-
-            let msg: Message = raw.into();
+            let msg = match msg {
+                Some(msg) => msg,
+                None => continue,
+            };
             if skip_internal && INTERNAL_TYPES.contains(&msg.msg_type.as_str()) {
                 continue;
             }
@@ -401,7 +816,7 @@ impl SessionStore {
     }
 
     fn load_stats(&self) -> Option<Value> {
-        let path = Self::stats_file();
+        let path = SessionSource::Claudecode.stats_file();
         let raw = fs::read_to_string(path).ok()?;
         serde_json::from_str(&raw).ok()
     }
@@ -416,10 +831,6 @@ fn relative_time(ts_ms: i64) -> String {
     let delta = now.signed_duration_since(when);
     let mins = delta.num_minutes();
     let hrs = delta.num_hours();
-    let days = delta.num_days();
-    let weeks = days / 7;
-    let months = days / 30;
-    let years = days / 365;
 
     if mins < 1 {
         "just now".to_string()
@@ -427,16 +838,8 @@ fn relative_time(ts_ms: i64) -> String {
         format!("{mins}m ago")
     } else if hrs < 24 {
         format!("{hrs}h ago")
-    } else if days < 2 {
-        "yesterday".to_string()
-    } else if days < 7 {
-        format!("{days} days ago")
-    } else if days < 30 {
-        format!("{weeks}w ago")
-    } else if days < 365 {
-        format!("{months}mo ago")
     } else {
-        format!("{years}y ago")
+        when.format("%Y-%m-%d").to_string()
     }
 }
 
@@ -469,6 +872,11 @@ fn render_conversation(
     thinking: bool,
     tail: Option<usize>,
 ) -> Vec<String> {
+    let assistant_label = if session.source == SessionSource::Codex {
+        "Codex"
+    } else {
+        "Claude"
+    };
     let mut lines = Vec::new();
     lines.push(format!("Session: {}", truncate(&session.display, 120)));
     lines.push(format!(
@@ -513,7 +921,7 @@ fn render_conversation(
             let mut parts: Vec<String> = Vec::new();
             for block in msg.content_blocks() {
                 let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
-                if btype == "text" {
+                if matches!(btype, "text" | "input_text" | "output_text") {
                     let text = block_text(&block).unwrap_or_default();
                     if !text.trim().is_empty() {
                         parts.push(text);
@@ -566,11 +974,11 @@ fn render_conversation(
             if !parts.is_empty() {
                 let model = msg.model();
                 if model.is_empty() {
-                    lines.push(format!("Claude: {}", parts.join("\n")));
+                    lines.push(format!("{assistant_label}: {}", parts.join("\n")));
                 } else if model != "<synthetic>" {
-                    lines.push(format!("Claude ({model}): {}", parts.join("\n")));
+                    lines.push(format!("{assistant_label} ({model}): {}", parts.join("\n")));
                 } else {
-                    lines.push(format!("Claude: {}", parts.join("\n")));
+                    lines.push(format!("{assistant_label}: {}", parts.join("\n")));
                 }
                 lines.push(String::new());
             }
@@ -588,6 +996,11 @@ fn render_search_results(results: Vec<(SessionInfo, Message, String)>) -> String
     let mut out = String::new();
     out.push_str(&format!("{} match(es)\n\n", results.len()));
     for (session, msg, line) in results {
+        let assistant_label = if session.source == SessionSource::Codex {
+            "Codex"
+        } else {
+            "Claude"
+        };
         out.push_str(&format!(
             "{}  {}  {}\n",
             session.short_id(),
@@ -596,8 +1009,12 @@ fn render_search_results(results: Vec<(SessionInfo, Message, String)>) -> String
         ));
         out.push_str(&format!("  {}\n", truncate(&session.display, 80)));
         let role = msg.role();
-        let role_color = if role == "user" { "You" } else { "Claude" };
-        out.push_str(&format!("  {role_color}: {}\n\n", truncate(&line, 100)));
+        let role_label = if role == "user" {
+            "You"
+        } else {
+            assistant_label
+        };
+        out.push_str(&format!("  {role_label}: {}\n\n", truncate(&line, 100)));
     }
     out
 }
@@ -853,10 +1270,13 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
             .into_iter()
             .map(|s| {
                 serde_json::json!({
+                    "source": s.source.label(),
                     "session_id": s.session_id,
                     "display": s.display,
                     "project": s.project,
                     "timestamp": s.timestamp,
+                    "model": s.model,
+                    "file_path": s.file_path,
                 })
             })
             .collect();
@@ -864,18 +1284,50 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
         return value;
     }
 
-    out.push_str("  ID    time     project                    title\n");
-    out.push_str(&"-".repeat(72));
+    let source_width = subset
+        .iter()
+        .map(|s| s.source.label().len())
+        .max()
+        .unwrap_or(6)
+        .max("source".len());
+    let time_width = subset
+        .iter()
+        .map(|s| relative_time(s.timestamp).len())
+        .max()
+        .unwrap_or(4)
+        .max("time".len());
+    let project_width = subset
+        .iter()
+        .map(|s| short_project(&s.project).chars().count().min(32))
+        .max()
+        .unwrap_or(7)
+        .max("project".len());
+    let title_width = subset
+        .iter()
+        .map(|s| s.display.chars().count().min(48))
+        .max()
+        .unwrap_or(5)
+        .max("title".len());
+
+    out.push_str(&format!(
+        "{: <source_width$}  {: <8}  {: <time_width$}  {: <project_width$}  {}\n",
+        "source", "ID", "time", "project", "title"
+    ));
+    let line_width = source_width + 2 + 8 + 2 + time_width + 2 + project_width + 2 + title_width;
+    out.push_str(&"-".repeat(line_width));
     out.push('\n');
     for s in subset {
         let short_id = s.short_id();
         let time = relative_time(s.timestamp);
-        let proj = truncate(&short_project(&s.project), 24)
+        let proj = truncate(&short_project(&s.project), project_width)
             .chars()
-            .take(24)
+            .take(project_width)
             .collect::<String>();
-        let title = truncate(&s.display, 36);
-        out.push_str(&format!("{short_id:8}  {time:<8}  {proj:<24}  {title}\n"));
+        let title = truncate(&s.display, title_width);
+        out.push_str(&format!(
+            "{: <source_width$}  {short_id:8}  {time:<time_width$}  {proj:<project_width$}  {title}\n",
+            s.source.label()
+        ));
     }
     out
 }
@@ -955,9 +1407,15 @@ fn run_tui() -> Result<()> {
                         let project = truncate(&short_project(&s.project), 24);
                         let (size, is_large_size) = file_size_for_session(&s.file_path);
                         let prompt_w = (chunks[1].width as usize)
-                            .saturating_sub(10 + 3 + 24 + 3 + 8 + 3)
+                            .saturating_sub(8 + 3 + 10 + 3 + 24 + 3 + 8 + 3)
                             .max(20);
                         let prompt = truncate(&s.display, prompt_w);
+                        let source = s.source.label();
+                        let source_style = if s.source == SessionSource::Codex {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Blue)
+                        };
                         let size_style = if is_large_size {
                             Style::default().fg(Color::Red)
                         } else {
@@ -968,6 +1426,8 @@ fn run_tui() -> Result<()> {
                                 format!("{time:>10}"),
                                 Style::default().fg(Color::DarkGray),
                             ),
+                            Span::from("   "),
+                            Span::styled(format!("{source:12}"), source_style),
                             Span::from("   "),
                             Span::styled(format!("{project:24}"), Style::default().fg(Color::Cyan)),
                             Span::from("   "),
@@ -1130,6 +1590,7 @@ fn apply_filter(filtered: &mut Vec<SessionInfo>, sessions: &[SessionInfo], filte
         if session.display.to_lowercase().contains(&q)
             || session.project.to_lowercase().contains(&q)
             || session.session_id.to_lowercase().contains(&q)
+            || session.source.label().to_lowercase().contains(&q)
         {
             filtered.push(session.clone());
         }
@@ -1165,8 +1626,12 @@ fn resolve_resume_cwd(session: &SessionInfo) -> Result<PathBuf> {
     }
 
     if !configured.exists() {
-        fs::create_dir_all(configured)
-            .with_context(|| format!("failed to create project directory {}", configured.display()))?;
+        fs::create_dir_all(configured).with_context(|| {
+            format!(
+                "failed to create project directory {}",
+                configured.display()
+            )
+        })?;
     }
 
     if configured.exists() {
@@ -1181,9 +1646,25 @@ fn resolve_resume_cwd(session: &SessionInfo) -> Result<PathBuf> {
 
 fn resume_session(session: &SessionInfo) -> Result<()> {
     let session_id = shell_single_quote(&session.session_id);
+    let resume_cmd = session.source.resume_command();
+    let fallback = session.source.fallback_resume_command();
+    let resume_invocation = session.source.resume_invocation();
+    let model_arg = if session.source == SessionSource::Codex {
+        if codex_model_candidate(&session.model).is_some() {
+            format!(" -m {}", shell_single_quote(&session.model))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     let script = format!(
-        "cc_session_id={}; if whence -w cc >/dev/null 2>&1; then cc --resume \"$cc_session_id\"; else claude --resume \"$cc_session_id\"; fi",
-        session_id
+        "cs_session_id={session_id}; if whence -w {resume_cmd} >/dev/null 2>&1; then {resume_cmd} {invocation}{model_arg}; elif whence -w {fallback} >/dev/null 2>&1; then {fallback} {invocation}{model_arg}; fi",
+        session_id = session_id,
+        resume_cmd = resume_cmd,
+        invocation = resume_invocation,
+        fallback = fallback,
+        model_arg = model_arg,
     );
 
     let mut cmd = Command::new("zsh");
