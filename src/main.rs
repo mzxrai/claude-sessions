@@ -115,6 +115,8 @@ struct SessionInfo {
     project: String,
     timestamp: i64,
     model: String,
+    #[serde(default)]
+    reasoning_effort: String,
     file_path: Option<String>,
 }
 
@@ -142,6 +144,7 @@ struct CachedCodexSession {
     cwd: Option<String>,
     timestamp_ms: Option<i64>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 struct StatsSourceRow {
@@ -196,6 +199,7 @@ struct CodexSessionFileInfo {
     cwd: Option<String>,
     timestamp_ms: Option<i64>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -351,16 +355,37 @@ fn codex_iso_to_ms(ts: &str) -> Option<i64> {
 }
 
 fn codex_model_candidate(model: &str) -> Option<String> {
-    let trimmed = model.trim();
-    if trimmed.is_empty() || trimmed == "<synthetic>" {
+    let first = model
+        .split_whitespace()
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if first.is_empty() || first == "<synthetic>" {
         return None;
     }
 
-    let is_valid = trimmed
+    let is_valid = first
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'));
     if is_valid {
-        Some(trimmed.to_string())
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
+fn codex_effort_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let is_valid = normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
+    if is_valid {
+        Some(normalized)
     } else {
         None
     }
@@ -588,6 +613,7 @@ impl SessionStore {
                             project,
                             timestamp,
                             model: String::new(),
+                            reasoning_effort: String::new(),
                             file_path: None,
                         },
                     );
@@ -728,6 +754,7 @@ impl SessionStore {
             || cached.project != session.project
             || cached.timestamp != session.timestamp
             || cached.model != session.model
+            || cached.reasoning_effort != session.reasoning_effort
             || cached.file_path != session.file_path
         {
             *cached = session.clone();
@@ -756,6 +783,11 @@ impl SessionStore {
         if session.model.is_empty() {
             if let Some(model) = cached.model.as_deref() {
                 session.model = model.to_string();
+            }
+        }
+        if session.reasoning_effort.is_empty() {
+            if let Some(reasoning_effort) = cached.reasoning_effort.as_deref() {
+                session.reasoning_effort = reasoning_effort.to_string();
             }
         }
     }
@@ -793,6 +825,9 @@ impl SessionStore {
             }
             if let Some(model) = info.model.as_ref() {
                 entry.model = Some(model.clone());
+            }
+            if let Some(reasoning_effort) = info.reasoning_effort.as_ref() {
+                entry.reasoning_effort = Some(reasoning_effort.clone());
             }
         }
         self.cache
@@ -863,6 +898,18 @@ impl SessionStore {
                                     if session.timestamp == 0 {
                                         session.timestamp = info.timestamp_ms.unwrap_or(0);
                                     }
+                                    if session.model.is_empty() {
+                                        if let Some(model) = info.model.as_deref() {
+                                            session.model = model.to_string();
+                                        }
+                                    }
+                                    if session.reasoning_effort.is_empty() {
+                                        if let Some(reasoning_effort) =
+                                            info.reasoning_effort.as_deref()
+                                        {
+                                            session.reasoning_effort = reasoning_effort.to_string();
+                                        }
+                                    }
                                     self.update_codex_cache(&session.session_id, path, Some(&info));
                                 } else {
                                     self.update_codex_cache(&session.session_id, path, None);
@@ -921,7 +968,8 @@ impl SessionStore {
             if let Some(path) = session.file_path.as_deref().map(Path::new) {
                 let needs_meta = session.project.is_empty()
                     || session.timestamp == 0
-                    || session.model.is_empty();
+                    || session.model.is_empty()
+                    || session.reasoning_effort.is_empty();
                 if needs_meta {
                     if let Some(info) = self.codex_file_info_from_session_file(path, session_id) {
                         if session.project.is_empty() {
@@ -939,6 +987,12 @@ impl SessionStore {
                         if session.model.is_empty() {
                             if let Some(model) = info.model.as_deref() {
                                 session.model = model.to_string();
+                                session_changed = true;
+                            }
+                        }
+                        if session.reasoning_effort.is_empty() {
+                            if let Some(reasoning_effort) = info.reasoning_effort.as_deref() {
+                                session.reasoning_effort = reasoning_effort.to_string();
                                 session_changed = true;
                             }
                         }
@@ -1314,6 +1368,24 @@ impl SessionStore {
                         out.model = Some(model);
                     }
                 }
+                if let Some(reasoning_effort) = payload
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .and_then(codex_effort_candidate)
+                {
+                    out.reasoning_effort = Some(reasoning_effort);
+                }
+                if out.reasoning_effort.is_none() {
+                    if let Some(reasoning_effort) = payload
+                        .get("collaboration_mode")
+                        .and_then(|v| v.get("settings"))
+                        .and_then(|v| v.get("reasoning_effort"))
+                        .and_then(Value::as_str)
+                        .and_then(codex_effort_candidate)
+                    {
+                        out.reasoning_effort = Some(reasoning_effort);
+                    }
+                }
                 continue;
             }
 
@@ -1333,7 +1405,11 @@ impl SessionStore {
             }
         }
 
-        if out.cwd.is_none() && out.timestamp_ms.is_none() && out.model.is_none() {
+        if out.cwd.is_none()
+            && out.timestamp_ms.is_none()
+            && out.model.is_none()
+            && out.reasoning_effort.is_none()
+        {
             None
         } else {
             Some(out)
@@ -1862,6 +1938,7 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
                     "project": s.project,
                     "timestamp": s.timestamp,
                     "model": s.model,
+                    "reasoning_effort": s.reasoning_effort,
                     "file_path": s.file_path,
                 })
             })
@@ -2270,13 +2347,24 @@ fn resume_session(session: &SessionInfo) -> Result<()> {
     } else {
         String::new()
     };
+    let effort_arg = if session.source == SessionSource::Codex {
+        codex_effort_candidate(&session.reasoning_effort)
+            .map(|effort| {
+                let config_pair = format!("model_reasoning_effort=\"{effort}\"");
+                format!(" -c {}", shell_single_quote(&config_pair))
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let script = format!(
-        "cs_session_id={session_id}; if whence -w {resume_cmd} >/dev/null 2>&1; then {resume_cmd} {invocation}{model_arg}; elif whence -w {fallback} >/dev/null 2>&1; then {fallback} {invocation}{model_arg}; fi",
+        "cs_session_id={session_id}; if whence -w {resume_cmd} >/dev/null 2>&1; then {resume_cmd} {invocation}{model_arg}{effort_arg}; elif whence -w {fallback} >/dev/null 2>&1; then {fallback} {invocation}{model_arg}{effort_arg}; fi",
         session_id = session_id,
         resume_cmd = resume_cmd,
         invocation = resume_invocation,
         fallback = fallback,
         model_arg = model_arg,
+        effort_arg = effort_arg,
     );
 
     let mut cmd = Command::new("zsh");
@@ -2458,6 +2546,7 @@ mod tests {
             project: "/tmp/project".to_string(),
             timestamp: 2_000,
             model: "claude-opus-4-6".to_string(),
+            reasoning_effort: String::new(),
             file_path: Some("/tmp/recent.jsonl".to_string()),
         };
         let target = SessionInfo {
@@ -2467,6 +2556,7 @@ mod tests {
             project: "/tmp/project".to_string(),
             timestamp: 1_000,
             model: String::new(),
+            reasoning_effort: String::new(),
             file_path: Some("/tmp/target.jsonl".to_string()),
         };
 
@@ -2523,5 +2613,61 @@ mod tests {
         assert!(rendered.contains("CODEX:"));
         assert!(rendered.contains("claude-opus-4-6"));
         assert!(rendered.contains("gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn codex_model_candidate_normalizes_effort_suffix() {
+        assert_eq!(
+            codex_model_candidate("gpt-5.3-codex high").as_deref(),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            codex_model_candidate("  gpt-5.3-codex   medium ").as_deref(),
+            Some("gpt-5.3-codex")
+        );
+    }
+
+    #[test]
+    fn codex_effort_candidate_normalizes_case() {
+        assert_eq!(codex_effort_candidate("HIGH").as_deref(), Some("high"));
+        assert_eq!(codex_effort_candidate("xhigh").as_deref(), Some("xhigh"));
+        assert_eq!(codex_effort_candidate(""), None);
+        assert_eq!(codex_effort_candidate("high effort"), None);
+    }
+
+    #[test]
+    fn codex_file_info_extracts_model_and_effort() {
+        let session_id = "019c24fb-6f78-7a20-99d0-88871c381f5d";
+        let file_name = format!(
+            "cs-rs-codex-info-test-{}-{}.jsonl",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let path = env::temp_dir().join(file_name);
+        let fixture = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"timestamp\":\"2026-02-13T17:00:00.000Z\",\"cwd\":\"/tmp/demo\"}}}}\n\
+{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.3-codex high\",\"effort\":\"HIGH\",\"collaboration_mode\":{{\"settings\":{{\"reasoning_effort\":\"medium\"}}}}}}}}\n"
+        );
+        fs::write(&path, fixture).expect("failed to write fixture file");
+
+        let store = SessionStore {
+            sessions: HashMap::new(),
+            loaded: true,
+            cache: SessionCache {
+                version: 1,
+                ..SessionCache::default()
+            },
+            cache_dirty: false,
+        };
+        let info = store
+            .codex_file_info_from_session_file(&path, session_id)
+            .expect("expected codex file info");
+
+        assert_eq!(info.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(info.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(info.cwd.as_deref(), Some("/tmp/demo"));
+        assert_eq!(info.timestamp_ms, Some(1_771_002_000_000));
+
+        let _ = fs::remove_file(path);
     }
 }
