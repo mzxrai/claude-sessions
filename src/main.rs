@@ -713,6 +713,18 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    fn codex_session_file_changed(&self, session_id: &str, path: &Path) -> bool {
+        let Some(cached) = self.cache.codex_sessions.get(session_id) else {
+            return true;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        let file_size = metadata.len();
+        let file_modified_ms = Self::metadata_modified_ms(&metadata).unwrap_or(0);
+        file_size != cached.file_size || file_modified_ms != cached.file_modified_ms
+    }
+
     fn clear_codex_cache_path(&mut self, session_id: &str) {
         if let Some(entry) = self.cache.codex_sessions.get_mut(session_id) {
             if !entry.file_path.is_empty() {
@@ -966,7 +978,9 @@ impl SessionStore {
 
         if source == SessionSource::Codex {
             if let Some(path) = session.file_path.as_deref().map(Path::new) {
-                let needs_meta = session.project.is_empty()
+                let file_changed = self.codex_session_file_changed(session_id, path);
+                let needs_meta = file_changed
+                    || session.project.is_empty()
                     || session.timestamp == 0
                     || session.model.is_empty()
                     || session.reasoning_effort.is_empty();
@@ -984,14 +998,18 @@ impl SessionStore {
                             session.timestamp = info.timestamp_ms.unwrap_or(0);
                             session_changed = true;
                         }
-                        if session.model.is_empty() {
-                            if let Some(model) = info.model.as_deref() {
+                        if let Some(model) = info.model.as_deref() {
+                            if (file_changed || session.model.is_empty())
+                                && session.model != model
+                            {
                                 session.model = model.to_string();
                                 session_changed = true;
                             }
                         }
-                        if session.reasoning_effort.is_empty() {
-                            if let Some(reasoning_effort) = info.reasoning_effort.as_deref() {
+                        if let Some(reasoning_effort) = info.reasoning_effort.as_deref() {
+                            if (file_changed || session.reasoning_effort.is_empty())
+                                && session.reasoning_effort != reasoning_effort
+                            {
                                 session.reasoning_effort = reasoning_effort.to_string();
                                 session_changed = true;
                             }
@@ -1002,11 +1020,13 @@ impl SessionStore {
             }
         }
 
-        if source == SessionSource::Claudecode && session.model.is_empty() {
+        if source == SessionSource::Claudecode {
             if let Some(path) = session.file_path.as_deref().map(Path::new) {
                 if let Some(model) = Self::claudecode_model_from_session_file(path) {
-                    session.model = model;
-                    session_changed = true;
+                    if session.model != model {
+                        session.model = model;
+                        session_changed = true;
+                    }
                 }
             }
         }
