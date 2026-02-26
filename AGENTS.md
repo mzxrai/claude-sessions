@@ -1,0 +1,2 @@
+- Always run `cargo build --release` after you've finished preparing & testing a change.
+- Make a git commit with a helpful commit message once done with a round of changes that are tested & confirmed working (smoke if applicable).
