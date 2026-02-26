@@ -92,8 +92,8 @@ Main list view:
 - `↑/↓`: move selection
 - `Ctrl-U` / `Ctrl-D`: move selection up/down
 - `Enter`: resume selected session
-- `v`: open conversation detail
-- `/`: search/filter sessions
+- `Option-V`: open conversation detail
+- `/`: full-text search/filter sessions
 - `Ctrl-C` or `q`: quit
 
 Detail view:

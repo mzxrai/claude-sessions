@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -15,6 +15,7 @@ use ratatui::Terminal;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs::{self, File};
@@ -40,6 +41,13 @@ impl SessionSource {
     fn label(&self) -> &'static str {
         match self {
             Self::Claudecode => "claude code",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn list_label(&self) -> &'static str {
+        match self {
+            Self::Claudecode => "cc",
             Self::Codex => "codex",
         }
     }
@@ -147,6 +155,13 @@ struct CachedCodexSession {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Clone)]
+struct SearchTextCacheEntry {
+    file_size: u64,
+    file_modified_ms: i64,
+    text: String,
+}
+
 struct StatsSourceRow {
     source: SessionSource,
     sessions: u64,
@@ -166,6 +181,10 @@ struct StatsReport {
 impl SessionInfo {
     fn short_id(&self) -> &str {
         &self.session_id[..self.session_id.len().min(8)]
+    }
+
+    fn list_id_tail(&self) -> String {
+        session_id_hex_tail(&self.session_id, 5)
     }
 }
 
@@ -454,11 +473,56 @@ fn file_size_for_session(file_path: &Option<String>) -> (String, bool) {
     }
 }
 
+fn session_mtime_ms(file_path: &Option<String>) -> Option<i64> {
+    file_path
+        .as_deref()
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| SessionStore::metadata_modified_ms(&metadata))
+}
+
+fn list_time_ms_for_session(session: &SessionInfo) -> i64 {
+    session_mtime_ms(&session.file_path).unwrap_or(session.timestamp)
+}
+
+fn list_time(session_ts_ms: i64) -> String {
+    let now = Local::now();
+    let when = match Local.timestamp_millis_opt(session_ts_ms).single() {
+        Some(ts) => ts,
+        None => return "—".to_string(),
+    };
+    let delta = now.signed_duration_since(when);
+    let mins = delta.num_minutes();
+    let hrs = delta.num_hours();
+
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins}m ago")
+    } else if hrs < 24 {
+        format!("{hrs}h ago")
+    } else {
+        when.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
+fn build_list_time_map(sessions: &[SessionInfo]) -> HashMap<String, i64> {
+    sessions
+        .iter()
+        .map(|session| {
+            (
+                session.source.internal_key(&session.session_id),
+                list_time_ms_for_session(session),
+            )
+        })
+        .collect()
+}
+
 struct SessionStore {
     sessions: HashMap<String, SessionInfo>,
     loaded: bool,
     cache: SessionCache,
     cache_dirty: bool,
+    search_text_cache: HashMap<String, SearchTextCacheEntry>,
 }
 
 impl SessionStore {
@@ -468,6 +532,7 @@ impl SessionStore {
             loaded: false,
             cache: Self::load_cache(),
             cache_dirty: false,
+            search_text_cache: HashMap::new(),
         }
     }
 
@@ -542,6 +607,18 @@ impl SessionStore {
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
+    }
+
+    fn search_text_signature(file_path: Option<&str>) -> (u64, i64) {
+        let Some(path) = file_path else {
+            return (0, 0);
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return (0, 0);
+        };
+        let file_size = metadata.len();
+        let file_modified_ms = Self::metadata_modified_ms(&metadata).unwrap_or(0);
+        (file_size, file_modified_ms)
     }
 
     fn parse_history_lines_into(
@@ -999,8 +1076,7 @@ impl SessionStore {
                             session_changed = true;
                         }
                         if let Some(model) = info.model.as_deref() {
-                            if (file_changed || session.model.is_empty())
-                                && session.model != model
+                            if (file_changed || session.model.is_empty()) && session.model != model
                             {
                                 session.model = model.to_string();
                                 session_changed = true;
@@ -1503,6 +1579,48 @@ impl SessionStore {
         out
     }
 
+    fn session_contains_full_text(&mut self, session: &SessionInfo, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+
+        let key = session.source.internal_key(&session.session_id);
+        let (file_size, file_modified_ms) =
+            Self::search_text_signature(session.file_path.as_deref());
+
+        let cache_miss_or_stale = match self.search_text_cache.get(&key) {
+            Some(cached) => {
+                cached.file_size != file_size || cached.file_modified_ms != file_modified_ms
+            }
+            None => true,
+        };
+
+        if cache_miss_or_stale {
+            let text = self
+                .read_messages(session, true)
+                .into_iter()
+                .map(|msg| msg.text())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
+
+            self.search_text_cache.insert(
+                key.clone(),
+                SearchTextCacheEntry {
+                    file_size,
+                    file_modified_ms,
+                    text,
+                },
+            );
+        }
+
+        self.search_text_cache
+            .get(&key)
+            .map(|cached| cached.text.contains(query))
+            .unwrap_or(false)
+    }
+
     fn search(
         &mut self,
         query: &str,
@@ -1711,6 +1829,25 @@ fn truncate(text: &str, width: usize) -> String {
     }
 }
 
+fn session_id_hex_tail(session_id: &str, count: usize) -> String {
+    let hex_chars: Vec<char> = session_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex_chars.len() >= count {
+        return hex_chars[hex_chars.len() - count..].iter().collect();
+    }
+
+    session_id
+        .chars()
+        .rev()
+        .take(count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
 fn render_conversation(
     store: &SessionStore,
     session: &SessionInfo,
@@ -1724,11 +1861,12 @@ fn render_conversation(
     };
     let mut lines = Vec::new();
     lines.push(format!("Session: {}", truncate(&session.display, 120)));
+    lines.push(format!("Source: {}", session.source.list_label()));
+    lines.push(format!("Session ID (full): {}", session.session_id));
     lines.push(format!(
-        "{}  ·  {}  ·  {}",
+        "{}  ·  {}",
         short_project(&session.project),
         relative_time(session.timestamp),
-        session.short_id()
     ));
     lines.push(String::new());
 
@@ -1946,11 +2084,18 @@ fn render_stats(stats: &StatsReport) -> String {
 fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize) -> String {
     let mut out = String::new();
     let subset: Vec<_> = sessions.into_iter().take(max_count).collect();
+    let rows: Vec<(SessionInfo, i64)> = subset
+        .into_iter()
+        .map(|s| {
+            let ts_ms = list_time_ms_for_session(&s);
+            (s, ts_ms)
+        })
+        .collect();
 
     if json_output {
-        let data: Vec<_> = subset
+        let data: Vec<_> = rows
             .into_iter()
-            .map(|s| {
+            .map(|(s, _)| {
                 serde_json::json!({
                     "source": s.source.label(),
                     "session_id": s.session_id,
@@ -1967,62 +2112,116 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
         return value;
     }
 
-    let source_width = subset
+    let source_width = rows
         .iter()
-        .map(|s| s.source.label().len())
+        .map(|(s, _)| s.source.list_label().len())
         .max()
         .unwrap_or(6)
         .max("source".len());
-    let time_width = subset
+    let time_width = rows
         .iter()
-        .map(|s| relative_time(s.timestamp).len())
+        .map(|(_, ts_ms)| list_time(*ts_ms).len())
         .max()
         .unwrap_or(4)
         .max("time".len());
-    let project_width = subset
+    let project_width = rows
         .iter()
-        .map(|s| short_project(&s.project).chars().count().min(32))
+        .map(|(s, _)| short_project(&s.project).chars().count().min(32))
         .max()
         .unwrap_or(7)
         .max("project".len());
-    let title_width = subset
+    let title_width = rows
         .iter()
-        .map(|s| s.display.chars().count().min(48))
+        .map(|(s, _)| s.display.chars().count().min(48))
         .max()
         .unwrap_or(5)
         .max("title".len());
 
     out.push_str(&format!(
-        "{: <source_width$}  {: <8}  {: <time_width$}  {: <project_width$}  {}\n",
-        "source", "ID", "time", "project", "title"
+        "{: <source_width$}  {: <5}  {: <time_width$}  {: <project_width$}  {}\n",
+        "source", "id5", "time", "project", "title"
     ));
-    let line_width = source_width + 2 + 8 + 2 + time_width + 2 + project_width + 2 + title_width;
+    let line_width = source_width + 2 + 5 + 2 + time_width + 2 + project_width + 2 + title_width;
     out.push_str(&"-".repeat(line_width));
     out.push('\n');
-    for s in subset {
-        let short_id = s.short_id();
-        let time = relative_time(s.timestamp);
+    for (s, ts_ms) in rows {
+        let short_id = s.list_id_tail();
+        let time = list_time(ts_ms);
         let proj = truncate(&short_project(&s.project), project_width)
             .chars()
             .take(project_width)
             .collect::<String>();
         let title = truncate(&s.display, title_width);
         out.push_str(&format!(
-            "{: <source_width$}  {short_id:8}  {time:<time_width$}  {proj:<project_width$}  {title}\n",
-            s.source.label()
+            "{: <source_width$}  {short_id:5}  {time:<time_width$}  {proj:<project_width$}  {title}\n",
+            s.source.list_label()
         ));
     }
     out
 }
 
+fn is_view_shortcut(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+}
+
+fn open_selected_detail(
+    store: &mut SessionStore,
+    filtered: &[SessionInfo],
+    list_state: &ListState,
+    detail_lines: &mut Vec<String>,
+    in_detail: &mut bool,
+    detail_scroll: &mut usize,
+) {
+    let idx = list_state.selected().unwrap_or_default();
+    if idx >= filtered.len() {
+        return;
+    }
+
+    let selected = &filtered[idx];
+    let session = store
+        .get_exact(selected.source, &selected.session_id)
+        .unwrap_or_else(|| selected.clone());
+    *detail_lines = render_conversation(store, &session, false, None);
+    *in_detail = true;
+    *detail_scroll = 0;
+}
+
+fn refresh_filter_results(
+    store: &mut SessionStore,
+    filtered: &mut Vec<SessionInfo>,
+    sessions: &[SessionInfo],
+    previous_filter: &mut String,
+    filter: &str,
+) {
+    let candidate_pool =
+        if !previous_filter.is_empty() && filter.starts_with(previous_filter.as_str()) {
+            filtered.clone()
+        } else {
+            sessions.to_vec()
+        };
+    apply_filter(store, filtered, &candidate_pool, filter);
+    previous_filter.clear();
+    previous_filter.push_str(filter);
+}
+
 fn run_tui() -> Result<()> {
     let mut store = SessionStore::new();
-    let sessions = store.all();
+    let mut sessions = store.all();
+    let list_time_by_session = build_list_time_map(&sessions);
+    sessions.sort_by_cached_key(|s| {
+        Reverse(
+            *list_time_by_session
+                .get(&s.source.internal_key(&s.session_id))
+                .unwrap_or(&s.timestamp),
+        )
+    });
     let mut filtered = sessions.clone();
     let mut list_state = ListState::default();
     list_state.select(Some(0));
 
     let mut filter = String::new();
+    let mut previous_filter = String::new();
     let mut filter_input = false;
     let mut in_detail = false;
     let mut detail_lines = Vec::<String>::new();
@@ -2050,14 +2249,14 @@ fn run_tui() -> Result<()> {
             let status = if in_detail {
                 " [↑/↓] scroll  [Esc]/[b] back  [Ctrl-c]/[q] quit"
             } else {
-                " [↑/↓ or Ctrl-u/Ctrl-d] navigate  [Enter] resume  [v] view  [/] search  [Ctrl-c]/[q] quit"
+                " [↑/↓ or Ctrl-u/Ctrl-d] navigate  [Enter] resume  [Option-v] view  [/] search  [Ctrl-c]/[q] quit"
             };
 
             if !in_detail {
                 let filter_text = if filter_input {
                     format!("> {filter}")
                 } else {
-                    "Type to search sessions...".to_string()
+                    "Type to full-text search sessions...".to_string()
                 };
                 f.render_widget(
                     Paragraph::new(filter_text)
@@ -2086,18 +2285,24 @@ fn run_tui() -> Result<()> {
                 let items: Vec<ListItem> = filtered
                     .iter()
                     .map(|s| {
-                        let time = relative_time(s.timestamp);
+                        let time = list_time(
+                            *list_time_by_session
+                                .get(&s.source.internal_key(&s.session_id))
+                                .unwrap_or(&s.timestamp),
+                        );
+                        let id_tail = s.list_id_tail();
                         let project = truncate(&short_project(&s.project), 24);
                         let (size, is_large_size) = file_size_for_session(&s.file_path);
                         let prompt_w = (chunks[1].width as usize)
-                            .saturating_sub(8 + 3 + 10 + 3 + 24 + 3 + 8 + 3)
+                            .saturating_sub(16 + 3 + 5 + 3 + 5 + 3 + 24 + 3 + 8 + 3)
                             .max(20);
                         let prompt = truncate(&s.display, prompt_w);
-                        let source = s.source.label();
+                        let source = s.source.list_label();
                         let source_style = if s.source == SessionSource::Codex {
-                            Style::default().fg(Color::Green)
+                            Style::default().fg(Color::Rgb(88, 166, 255))
                         } else {
-                            Style::default().fg(Color::Blue)
+                            // Anthropic-style orange for cc rows.
+                            Style::default().fg(Color::Rgb(217, 119, 87))
                         };
                         let size_style = if is_large_size {
                             Style::default().fg(Color::Red)
@@ -2106,11 +2311,13 @@ fn run_tui() -> Result<()> {
                         };
                         let row = Line::from(vec![
                             Span::styled(
-                                format!("{time:>10}"),
+                                format!("{time:>16}"),
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::from("   "),
-                            Span::styled(format!("{source:12}"), source_style),
+                            Span::styled(format!("{source:5}"), source_style),
+                            Span::from("   "),
+                            Span::styled(format!("{id_tail:>5}"), Style::default().fg(Color::DarkGray)),
                             Span::from("   "),
                             Span::styled(format!("{project:24}"), Style::default().fg(Color::Cyan)),
                             Span::from("   "),
@@ -2173,23 +2380,86 @@ fn run_tui() -> Result<()> {
         }
 
         if filter_input {
+            if is_view_shortcut(&key) {
+                open_selected_detail(
+                    &mut store,
+                    &filtered,
+                    &list_state,
+                    &mut detail_lines,
+                    &mut in_detail,
+                    &mut detail_scroll,
+                );
+                continue;
+            }
+
             match key.code {
                 KeyCode::Esc => {
                     filter_input = false;
                     filter.clear();
-                    apply_filter(&mut filtered, &sessions, &filter);
+                    refresh_filter_results(
+                        &mut store,
+                        &mut filtered,
+                        &sessions,
+                        &mut previous_filter,
+                        &filter,
+                    );
                     list_state.select(Some(0));
                 }
                 KeyCode::Backspace => {
                     filter.pop();
-                    apply_filter(&mut filtered, &sessions, &filter);
+                    refresh_filter_results(
+                        &mut store,
+                        &mut filtered,
+                        &sessions,
+                        &mut previous_filter,
+                        &filter,
+                    );
                     list_state.select(Some(0));
                 }
+                KeyCode::Up => {
+                    let prev = match list_state.selected() {
+                        Some(0) | None => 0,
+                        Some(i) => i.saturating_sub(1),
+                    };
+                    list_state.select(Some(prev));
+                }
+                KeyCode::Down => {
+                    let len = filtered.len();
+                    let next = match list_state.selected() {
+                        Some(i) => {
+                            if i + 1 < len {
+                                i + 1
+                            } else {
+                                i
+                            }
+                        }
+                        None => 0,
+                    };
+                    list_state.select(Some(next));
+                }
+                KeyCode::Enter => {
+                    let idx = list_state.selected().unwrap_or_default();
+                    if idx < filtered.len() {
+                        let selected = &filtered[idx];
+                        let session = store
+                            .get_exact(selected.source, &selected.session_id)
+                            .unwrap_or_else(|| selected.clone());
+                        cleanup_terminal(&mut terminal)?;
+                        resume_session(&session)?;
+                        return Ok(());
+                    }
+                }
                 KeyCode::Char(c) => {
-                    if !c.is_control() {
+                    if !c.is_control() && key.modifiers.is_empty() {
                         filter.push(c);
                     }
-                    apply_filter(&mut filtered, &sessions, &filter);
+                    refresh_filter_results(
+                        &mut store,
+                        &mut filtered,
+                        &sessions,
+                        &mut previous_filter,
+                        &filter,
+                    );
                     list_state.select(Some(0));
                 }
                 _ => {}
@@ -2226,11 +2496,30 @@ fn run_tui() -> Result<()> {
             }
         }
 
+        if is_view_shortcut(&key) {
+            open_selected_detail(
+                &mut store,
+                &filtered,
+                &list_state,
+                &mut detail_lines,
+                &mut in_detail,
+                &mut detail_scroll,
+            );
+            continue;
+        }
+
         match key.code {
             KeyCode::Char('q') => break,
             KeyCode::Char('/') => {
                 filter_input = true;
                 filter.clear();
+                refresh_filter_results(
+                    &mut store,
+                    &mut filtered,
+                    &sessions,
+                    &mut previous_filter,
+                    &filter,
+                );
             }
             KeyCode::Esc => break,
             KeyCode::Up => {
@@ -2266,18 +2555,6 @@ fn run_tui() -> Result<()> {
                     return Ok(());
                 }
             }
-            KeyCode::Char('v') => {
-                let idx = list_state.selected().unwrap_or(0);
-                if idx < filtered.len() {
-                    let selected = &filtered[idx];
-                    let session = store
-                        .get_exact(selected.source, &selected.session_id)
-                        .unwrap_or_else(|| selected.clone());
-                    detail_lines = render_conversation(&store, &session, false, None);
-                    in_detail = true;
-                    detail_scroll = 0;
-                }
-            }
             _ => {}
         }
     }
@@ -2286,7 +2563,12 @@ fn run_tui() -> Result<()> {
     Ok(())
 }
 
-fn apply_filter(filtered: &mut Vec<SessionInfo>, sessions: &[SessionInfo], filter: &str) {
+fn apply_filter(
+    store: &mut SessionStore,
+    filtered: &mut Vec<SessionInfo>,
+    sessions: &[SessionInfo],
+    filter: &str,
+) {
     let q = filter.to_lowercase();
     if q.is_empty() {
         filtered.clear();
@@ -2296,10 +2578,14 @@ fn apply_filter(filtered: &mut Vec<SessionInfo>, sessions: &[SessionInfo], filte
 
     filtered.clear();
     for session in sessions {
+        let source_label = session.source.label().to_lowercase();
+        let source_list_label = session.source.list_label().to_lowercase();
         if session.display.to_lowercase().contains(&q)
             || session.project.to_lowercase().contains(&q)
             || session.session_id.to_lowercase().contains(&q)
-            || session.source.label().to_lowercase().contains(&q)
+            || source_label.contains(&q)
+            || source_list_label.contains(&q)
+            || store.session_contains_full_text(session, &q)
         {
             filtered.push(session.clone());
         }
@@ -2433,7 +2719,7 @@ fn list_command(
         sessions.retain(|s| s.timestamp >= since_ms);
     }
 
-    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    sessions.sort_by_cached_key(|s| Reverse(list_time_ms_for_session(s)));
     Ok(list_sessions(sessions, json, limit))
 }
 
@@ -2556,6 +2842,19 @@ fn output_with_optional_pager(output: &str, no_pager: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_store() -> SessionStore {
+        SessionStore {
+            sessions: HashMap::new(),
+            loaded: true,
+            cache: SessionCache {
+                version: 1,
+                ..SessionCache::default()
+            },
+            cache_dirty: false,
+            search_text_cache: HashMap::new(),
+        }
+    }
+
     #[test]
     fn get_exact_falls_back_to_recent_source_model() {
         let source = SessionSource::Claudecode;
@@ -2580,15 +2879,7 @@ mod tests {
             file_path: Some("/tmp/target.jsonl".to_string()),
         };
 
-        let mut store = SessionStore {
-            sessions: HashMap::new(),
-            loaded: true,
-            cache: SessionCache {
-                version: 1,
-                ..SessionCache::default()
-            },
-            cache_dirty: false,
-        };
+        let mut store = test_store();
         store
             .sessions
             .insert(source.internal_key(&recent.session_id), recent);
@@ -2670,15 +2961,7 @@ mod tests {
         );
         fs::write(&path, fixture).expect("failed to write fixture file");
 
-        let store = SessionStore {
-            sessions: HashMap::new(),
-            loaded: true,
-            cache: SessionCache {
-                version: 1,
-                ..SessionCache::default()
-            },
-            cache_dirty: false,
-        };
+        let store = test_store();
         let info = store
             .codex_file_info_from_session_file(&path, session_id)
             .expect("expected codex file info");
@@ -2689,5 +2972,90 @@ mod tests {
         assert_eq!(info.timestamp_ms, Some(1_771_002_000_000));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_id_hex_tail_uses_last_five_hex_chars() {
+        let id = "019c24fb-6f78-7a20-99d0-88871c381f5d";
+        assert_eq!(session_id_hex_tail(id, 5), "81f5d");
+    }
+
+    #[test]
+    fn apply_filter_matches_cc_source_alias() {
+        let mut store = test_store();
+        let sessions = vec![
+            SessionInfo {
+                source: SessionSource::Claudecode,
+                session_id: "a".to_string(),
+                display: "one".to_string(),
+                project: "/tmp/a".to_string(),
+                timestamp: 1,
+                model: String::new(),
+                reasoning_effort: String::new(),
+                file_path: None,
+            },
+            SessionInfo {
+                source: SessionSource::Codex,
+                session_id: "b".to_string(),
+                display: "two".to_string(),
+                project: "/tmp/b".to_string(),
+                timestamp: 1,
+                model: String::new(),
+                reasoning_effort: String::new(),
+                file_path: None,
+            },
+        ];
+        let mut filtered = Vec::new();
+        apply_filter(&mut store, &mut filtered, &sessions, "cc");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].source, SessionSource::Claudecode);
+    }
+
+    #[test]
+    fn apply_filter_matches_full_text_in_session_messages() {
+        let mut store = test_store();
+        let session_id = "fulltext-session";
+        let file_name = format!(
+            "cs-rs-fulltext-filter-test-{}-{}.jsonl",
+            std::process::id(),
+            Local::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let path = env::temp_dir().join(file_name);
+        let fixture = format!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-02-13T17:00:00.000Z\",\"isApiErrorMessage\":false,\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"this includes flibbertigibbet\"}}]}}}}\n"
+        );
+        fs::write(&path, fixture).expect("failed to write fixture file");
+
+        let sessions = vec![SessionInfo {
+            source: SessionSource::Claudecode,
+            session_id: session_id.to_string(),
+            display: "session".to_string(),
+            project: "/tmp/fulltext".to_string(),
+            timestamp: 1,
+            model: String::new(),
+            reasoning_effort: String::new(),
+            file_path: Some(path.to_string_lossy().to_string()),
+        }];
+
+        let mut filtered = Vec::new();
+        apply_filter(&mut store, &mut filtered, &sessions, "flibbertigibbet");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(store.search_text_cache.len(), 1);
+
+        apply_filter(&mut store, &mut filtered, &sessions, "flibber");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(store.search_text_cache.len(), 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn list_time_formats_older_values_with_date_and_clock_time() {
+        let ts_ms = Local
+            .with_ymd_and_hms(2026, 1, 2, 3, 4, 0)
+            .single()
+            .expect("valid local datetime")
+            .timestamp_millis();
+        assert_eq!(list_time(ts_ms), "2026-01-02 03:04");
     }
 }
