@@ -385,7 +385,7 @@ fn codex_model_candidate(model: &str) -> Option<String> {
 
     let is_valid = first
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'));
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '[' | ']'));
     if is_valid {
         Some(first.to_string())
     } else {
@@ -2644,12 +2644,18 @@ fn resume_session(session: &SessionInfo) -> Result<()> {
     let resume_cmd = session.source.resume_command();
     let fallback = session.source.fallback_resume_command();
     let resume_invocation = session.source.resume_invocation();
-    let model_arg = if let Some(model) = codex_model_candidate(&session.model) {
-        format!(
-            " {} {}",
-            session.source.resume_model_flag(),
-            shell_single_quote(&model)
-        )
+    // Claude Code: skip --model so the user's account default (including context
+    // window tier) takes effect. Codex: pass --model to preserve the exact model.
+    let model_arg = if session.source == SessionSource::Codex {
+        if let Some(model) = codex_model_candidate(&session.model) {
+            format!(
+                " {} {}",
+                session.source.resume_model_flag(),
+                shell_single_quote(&model)
+            )
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
@@ -3057,5 +3063,17 @@ mod tests {
             .expect("valid local datetime")
             .timestamp_millis();
         assert_eq!(list_time(ts_ms), "2026-01-02 03:04");
+    }
+
+    #[test]
+    fn codex_model_candidate_accepts_bracket_suffix() {
+        assert_eq!(
+            codex_model_candidate("claude-opus-4-6[1m]").as_deref(),
+            Some("claude-opus-4-6[1m]")
+        );
+        assert_eq!(
+            codex_model_candidate("claude-opus-4-6").as_deref(),
+            Some("claude-opus-4-6")
+        );
     }
 }
