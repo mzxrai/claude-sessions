@@ -537,7 +537,7 @@ impl SessionStore {
     }
 
     fn encode_path(path: &str) -> String {
-        path.replace('/', "-")
+        path.replace('/', "-").replace('.', "-")
     }
 
     fn cache_file_path() -> PathBuf {
