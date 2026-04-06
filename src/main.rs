@@ -383,9 +383,9 @@ fn codex_model_candidate(model: &str) -> Option<String> {
         return None;
     }
 
-    let is_valid = first
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '[' | ']'));
+    let is_valid = first.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '[' | ']')
+    });
     if is_valid {
         Some(first.to_string())
     } else {
@@ -494,18 +494,29 @@ fn list_time(session_ts_ms: i64) -> String {
     let mins = delta.num_minutes();
     let hrs = delta.num_hours();
 
-    if mins < 1 {
-        "just now".to_string()
+    let days = delta.num_days();
+
+    let secs = delta.num_seconds();
+
+    if secs < 60 {
+        "now".to_string()
+    } else if mins < 5 {
+        let rem_secs = secs - mins * 60;
+        format!("{mins}m {:02}s", rem_secs)
     } else if mins < 60 {
-        format!("{mins}m ago")
+        format!("{mins}m")
     } else if hrs < 24 {
-        format!("{hrs}h ago")
+        let rem_mins = mins - hrs * 60;
+        format!("{hrs}h {:02}m", rem_mins)
+    } else if days <= 3 {
+        let rem_hrs = hrs - days * 24;
+        format!("{days}d {:02}h", rem_hrs)
     } else {
-        when.format("%Y-%m-%d %H:%M").to_string()
+        format!("{days}d")
     }
 }
 
-fn build_list_time_map(sessions: &[SessionInfo]) -> HashMap<String, i64> {
+fn build_list_time_ms_map(sessions: &[SessionInfo]) -> HashMap<String, i64> {
     sessions
         .iter()
         .map(|session| {
@@ -514,6 +525,13 @@ fn build_list_time_map(sessions: &[SessionInfo]) -> HashMap<String, i64> {
                 list_time_ms_for_session(session),
             )
         })
+        .collect()
+}
+
+fn build_list_time_str_map(ms_map: &HashMap<String, i64>) -> HashMap<String, String> {
+    ms_map
+        .iter()
+        .map(|(k, v)| (k.clone(), list_time(*v)))
         .collect()
 }
 
@@ -537,7 +555,7 @@ impl SessionStore {
     }
 
     fn encode_path(path: &str) -> String {
-        path.replace('/', "-").replace('.', "-")
+        path.replace(['/', '.'], "-")
     }
 
     fn cache_file_path() -> PathBuf {
@@ -1786,24 +1804,11 @@ impl SessionStore {
 }
 
 fn relative_time(ts_ms: i64) -> String {
-    let now = Local::now();
-    let when = match Local.timestamp_millis_opt(ts_ms).single() {
-        Some(ts) => ts,
-        None => return "—".to_string(),
-    };
-    let delta = now.signed_duration_since(when);
-    let mins = delta.num_minutes();
-    let hrs = delta.num_hours();
+    list_time(ts_ms)
+}
 
-    if mins < 1 {
-        "just now".to_string()
-    } else if mins < 60 {
-        format!("{mins}m ago")
-    } else if hrs < 24 {
-        format!("{hrs}h ago")
-    } else {
-        when.format("%Y-%m-%d").to_string()
-    }
+fn is_worktree(project: &str) -> bool {
+    project.contains("/.worktrees/") || project.contains("/worktrees/")
 }
 
 fn short_project(project: &str) -> String {
@@ -1823,9 +1828,9 @@ fn truncate(text: &str, width: usize) -> String {
         text
     } else {
         text.chars()
-            .take(width.saturating_sub(3))
+            .take(width.saturating_sub(1))
             .collect::<String>()
-            + "..."
+            + "…"
     }
 }
 
@@ -1871,9 +1876,9 @@ fn render_conversation(
     lines.push(String::new());
 
     let mut msgs = store.read_messages(session, true);
+    msgs.reverse();
     if let Some(t) = tail {
-        let start = msgs.len().saturating_sub(t);
-        msgs = msgs.into_iter().skip(start).collect();
+        msgs.truncate(t);
     }
 
     for msg in msgs {
@@ -2123,7 +2128,8 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
         .map(|(_, ts_ms)| list_time(*ts_ms).len())
         .max()
         .unwrap_or(4)
-        .max("time".len());
+        .max("time".len())
+        .min(7);
     let project_width = rows
         .iter()
         .map(|(s, _)| short_project(&s.project).chars().count().min(32))
@@ -2138,22 +2144,24 @@ fn list_sessions(sessions: Vec<SessionInfo>, json_output: bool, max_count: usize
         .max("title".len());
 
     out.push_str(&format!(
-        "{: <source_width$}  {: <5}  {: <time_width$}  {: <project_width$}  {}\n",
-        "source", "id5", "time", "project", "title"
+        "{: <source_width$}  {: <5}  {: <time_width$}  {: <project_width$} {:4}  {}\n",
+        "source", "id5", "time", "project", "", "title"
     ));
-    let line_width = source_width + 2 + 5 + 2 + time_width + 2 + project_width + 2 + title_width;
+    let line_width =
+        source_width + 2 + 5 + 2 + time_width + 2 + project_width + 1 + 4 + 2 + title_width;
     out.push_str(&"-".repeat(line_width));
     out.push('\n');
     for (s, ts_ms) in rows {
         let short_id = s.list_id_tail();
         let time = list_time(ts_ms);
+        let wt = if is_worktree(&s.project) { "[wt]" } else { "" };
         let proj = truncate(&short_project(&s.project), project_width)
             .chars()
             .take(project_width)
             .collect::<String>();
         let title = truncate(&s.display, title_width);
         out.push_str(&format!(
-            "{: <source_width$}  {short_id:5}  {time:<time_width$}  {proj:<project_width$}  {title}\n",
+            "{: <source_width$}  {short_id:5}  {time:<time_width$}  {proj:<project_width$} {wt:4}  {title}\n",
             s.source.list_label()
         ));
     }
@@ -2208,10 +2216,11 @@ fn refresh_filter_results(
 fn run_tui() -> Result<()> {
     let mut store = SessionStore::new();
     let mut sessions = store.all();
-    let list_time_by_session = build_list_time_map(&sessions);
+    let list_time_ms_map = build_list_time_ms_map(&sessions);
+    let list_time_by_session = build_list_time_str_map(&list_time_ms_map);
     sessions.sort_by_cached_key(|s| {
         Reverse(
-            *list_time_by_session
+            *list_time_ms_map
                 .get(&s.source.internal_key(&s.session_id))
                 .unwrap_or(&s.timestamp),
         )
@@ -2285,16 +2294,16 @@ fn run_tui() -> Result<()> {
                 let items: Vec<ListItem> = filtered
                     .iter()
                     .map(|s| {
-                        let time = list_time(
-                            *list_time_by_session
-                                .get(&s.source.internal_key(&s.session_id))
-                                .unwrap_or(&s.timestamp),
-                        );
+                        let time = list_time_by_session
+                            .get(&s.source.internal_key(&s.session_id))
+                            .cloned()
+                            .unwrap_or_default();
                         let id_tail = s.list_id_tail();
-                        let project = truncate(&short_project(&s.project), 24);
+                        let wt = if is_worktree(&s.project) { "[wt]" } else { "" };
+                        let project = truncate(&short_project(&s.project), 38);
                         let (size, is_large_size) = file_size_for_session(&s.file_path);
                         let prompt_w = (chunks[1].width as usize)
-                            .saturating_sub(16 + 3 + 5 + 3 + 5 + 3 + 24 + 3 + 8 + 3)
+                            .saturating_sub(7 + 3 + 5 + 3 + 5 + 3 + 38 + 1 + 4 + 3 + 8 + 3)
                             .max(20);
                         let prompt = truncate(&s.display, prompt_w);
                         let source = s.source.list_label();
@@ -2311,7 +2320,7 @@ fn run_tui() -> Result<()> {
                         };
                         let row = Line::from(vec![
                             Span::styled(
-                                format!("{time:>16}"),
+                                format!("{time:>7}"),
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::from("   "),
@@ -2319,7 +2328,9 @@ fn run_tui() -> Result<()> {
                             Span::from("   "),
                             Span::styled(format!("{id_tail:>5}"), Style::default().fg(Color::DarkGray)),
                             Span::from("   "),
-                            Span::styled(format!("{project:24}"), Style::default().fg(Color::Cyan)),
+                            Span::styled(format!("{project:38}"), Style::default().fg(Color::Cyan)),
+                            Span::from(" "),
+                            Span::styled(format!("{wt:4}"), Style::default().fg(Color::Yellow)),
                             Span::from("   "),
                             Span::styled(format!("{size:>8}"), size_style),
                             Span::from("   "),
@@ -2342,7 +2353,7 @@ fn run_tui() -> Result<()> {
             );
         })?;
 
-        if !event::poll(StdDuration::from_millis(200))? {
+        if !event::poll(StdDuration::from_secs(60))? {
             continue;
         }
 
@@ -2361,7 +2372,7 @@ fn run_tui() -> Result<()> {
         if in_detail {
             match key.code {
                 KeyCode::Char('q') => break,
-                KeyCode::Esc | KeyCode::Char('b') => {
+                KeyCode::Esc | KeyCode::Char('b') | KeyCode::Left => {
                     in_detail = false;
                     detail_scroll = 0;
                     detail_lines.clear();
@@ -2496,7 +2507,7 @@ fn run_tui() -> Result<()> {
             }
         }
 
-        if is_view_shortcut(&key) {
+        if key.code == KeyCode::Right || is_view_shortcut(&key) {
             open_selected_detail(
                 &mut store,
                 &filtered,
@@ -3056,13 +3067,28 @@ mod tests {
     }
 
     #[test]
-    fn list_time_formats_older_values_with_date_and_clock_time() {
-        let ts_ms = Local
-            .with_ymd_and_hms(2026, 1, 2, 3, 4, 0)
-            .single()
-            .expect("valid local datetime")
-            .timestamp_millis();
-        assert_eq!(list_time(ts_ms), "2026-01-02 03:04");
+    fn list_time_formats_relative_days() {
+        let now = Local::now();
+
+        // 3 minutes 30 seconds → "3m 30s"
+        let ts = now - chrono::Duration::seconds(210);
+        assert_eq!(list_time(ts.timestamp_millis()), "3m 30s");
+
+        // 6 hours 23 minutes → "6h 23m"
+        let ts = now - chrono::Duration::minutes(383);
+        assert_eq!(list_time(ts.timestamp_millis()), "6h 23m");
+
+        // 3 hours 2 minutes → "3h 02m"
+        let ts = now - chrono::Duration::minutes(182);
+        assert_eq!(list_time(ts.timestamp_millis()), "3h 02m");
+
+        // 2 days and 5 hours → "2d 05h"
+        let ts = now - chrono::Duration::hours(53);
+        assert_eq!(list_time(ts.timestamp_millis()), "2d 05h");
+
+        // 10 days → "10d"
+        let ts = now - chrono::Duration::days(10);
+        assert_eq!(list_time(ts.timestamp_millis()), "10d");
     }
 
     #[test]
